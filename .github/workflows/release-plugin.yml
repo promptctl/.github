@@ -1,0 +1,67 @@
+name: release-plugin
+
+# The one release implementation for every promptctl Claude Code plugin repo.
+# Callers trigger it on a pushed `<name>--v<version>` tag, the shape
+# `claude plugin tag` creates. The procedure is in RELEASING.md at this repo's root.
+#
+# The workflow never writes to a branch and never moves a tag. It resolves the
+# plugin from the tag through the caller's marketplace.json, checks that the
+# plugin manifest and the plugin's CHANGELOG.md agree with the tag, and publishes
+# that changelog section as the release notes. [LAW:one-source-of-truth] the
+# changelog section is authored in the PR that bumps the version; the release
+# derives from it.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: write # create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the plugin from the tag and check it agrees with the tree
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+
+          # [LAW:parse-dont-validate] one parse yields name and version; everything
+          # below consumes those, never the raw tag.
+          case "${tag}" in
+            *--v*) ;;
+            *) echo "::error::tag '${tag}' is not of the form <name>--v<version>"; exit 1 ;;
+          esac
+          name="${tag%%--v*}"
+          version="${tag#*--v}"
+
+          source="$(jq -er --arg n "${name}" \
+            '.plugins[] | select(.name == $n) | .source' .claude-plugin/marketplace.json)" \
+            || { echo "::error::.claude-plugin/marketplace.json lists no plugin named '${name}'"; exit 1; }
+          dir="${source#./}"
+
+          manifest_version="$(jq -er '.version' "${dir}/.claude-plugin/plugin.json")"
+          if [ "${manifest_version}" != "${version}" ]; then
+            echo "::error::tag ${tag} but ${dir}/.claude-plugin/plugin.json says version ${manifest_version}"
+            exit 1
+          fi
+
+          # Lines under the `## v<version> - <date>` header, up to the next `## ` header.
+          awk -v v="v${version}" '/^## /{ inside = ($2 == v); next } inside' "${dir}/CHANGELOG.md" \
+            > "${RUNNER_TEMP}/notes.md"
+          if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/notes.md"; then
+            echo "::error::${dir}/CHANGELOG.md has no '## v${version} - <date>' section with content"
+            exit 1
+          fi
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file "${RUNNER_TEMP}/notes.md"
